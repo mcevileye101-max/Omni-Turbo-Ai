@@ -7,7 +7,7 @@ app.use(cors());
 
 // Aapki single Groq API key
 const API_KEY = "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";
-const MODEL_NAME = "llama-3.3-70b-versatile";
+const MODEL_NAME = "qwen/qwen3-32b";
 
 // Main API Endpoint jahan aapki apps requests bhejingi
 app.post('/api/brain', async (req, res) => {
