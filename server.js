@@ -39,7 +39,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                 'Content-Type': 'application/json'
             },
             body: JSON.stringify({
-                model: model || "llama-3.3-70b-versatile",
+                model: model || "qwen/qwen3.8-27b",
                 messages: messages,
                 temperature: 0.7,
                 max_tokens: 2048
