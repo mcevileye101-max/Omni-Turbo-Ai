@@ -5,29 +5,41 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
-// Aapki single Groq API key
-const API_KEY = "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";
-const MODEL_NAME = "qwen/qwen3-32b";
+// Internal Real Groq Key (Render Environment Variable se uthayega)
+const GROQ_KEY = process.env.GROQ_API_KEY;
 
-// Main API Endpoint jahan aapki apps requests bhejingi
-app.post('/api/brain', async (req, res) => {
-    const { messages } = req.body;
+// Aapki Exact Custom Secret Key
+const OMNI_TURBO_SECRET_KEY = "omni_turbo_ai_ultimate303vHx77";
+
+// Official OpenAI-Style Endpoint
+app.post('/v1/chat/completions', async (req, res) => {
+    const authHeader = req.headers.authorization;
+
+    // Custom Key Validation Check
+    if (!authHeader || authHeader !== `Bearer ${OMNI_TURBO_SECRET_KEY}`) {
+        return res.status(401).json({
+            error: {
+                message: "Invalid or missing Custom API Key. Authorization header must be 'Bearer omni_turbo_ai_ultimate303vHx77'",
+                type: "authentication_error"
+            }
+        });
+    }
+
+    const { messages, model } = req.body;
 
     if (!messages || !Array.isArray(messages)) {
         return res.status(400).json({ error: "Invalid format. 'messages' array is required." });
     }
 
     try {
-        console.log("⚡ Omni Turbo processing request...");
-
         const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
             method: 'POST',
             headers: {
-                'Authorization': `Bearer ${API_KEY}`,
+                'Authorization': `Bearer ${GROQ_KEY}`,
                 'Content-Type': 'application/json'
             },
             body: JSON.stringify({
-                model: MODEL_NAME,
+                model: model || "llama-3.3-70b-versatile",
                 messages: messages,
                 temperature: 0.7,
                 max_tokens: 2048
@@ -40,24 +52,24 @@ app.post('/api/brain', async (req, res) => {
             throw new Error(data.error?.message || "Groq API Error");
         }
 
-        res.json({
-            success: true,
-            system: "Omni Turbo",
-            response: data.choices[0].message
-        });
+        // Exact OpenAI/Groq Compatible Response Format
+        res.json(data);
 
     } catch (error) {
-        console.error("Error:", error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ error: { message: error.message } });
     }
 });
 
-// Health check route
+// Root Health Check Route
 app.get('/', (req, res) => {
-    res.send("⚡ Omni Turbo Brain is online and ready!");
+    res.json({
+        status: "active",
+        service: "Omni Turbo AI Gateway",
+        endpoint: "/v1/chat/completions"
+    });
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
     console.log(`⚡ Omni Turbo running on port ${PORT}`);
 });
