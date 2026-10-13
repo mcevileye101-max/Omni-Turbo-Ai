@@ -8,7 +8,6 @@ app.use(cors());
 
 // ---------- Configuration & Keys ----------
 const GROQ_KEY = process.env.GROQ_API_KEY;
-// Aapki Pollinations Secret Key backend ke liye
 const POLLINATIONS_API_KEY = process.env.POLLINATIONS_API_KEY || "sk_yYtT2910mwEF96lkP6WcrLNbg693pogo";
 
 const OMNI_TURBO_SECRET_KEY =
@@ -19,7 +18,6 @@ const UPSTREAM_MODEL = "qwen/qwen3.8-27b";
 const UPSTREAM_URL = "https://api.groq.com/openai/v1/chat/completions";
 const UPSTREAM_TIMEOUT_MS = 120000;
 
-// System Prompt for Deep Reasoning & Human Tone
 const SYSTEM_PROMPT = {
   role: "system",
   content: "You are Omni Turbo 0.2, an advanced AI gateway. Maintain a natural human tone, break down complex topics into core concepts, apply deep reasoning and logic, and provide clean code and problem-solving solutions."
@@ -100,6 +98,7 @@ app.post('/v1/chat/completions', rateLimit, async (req, res) => {
   // Check if image generation is requested
   const isImageRequest = promptText.toLowerCase().startsWith("generate image") || 
                          promptText.toLowerCase().startsWith("image of") ||
+                         promptText.toLowerCase().skip === true ||
                          promptText.toLowerCase().startsWith("draw ");
 
   if (isImageRequest) {
@@ -110,25 +109,11 @@ app.post('/v1/chat/completions', rateLimit, async (req, res) => {
 
       const cleanPrompt = promptText.replace(/^(generate image of|image of|draw)\s*/i, "");
       const encodedPrompt = encodeURIComponent(cleanPrompt);
+      const randomSeed = Math.floor(Math.random() * 1000000);
       
-      // Call Pollinations Flux model securely using the backend API key
-      const pollinationUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?model=flux&nologo=true`;
+      // Using the exact working Pollinations endpoint structure with the API Key
+      const workingPollinationsUrl = `https://gen.pollinations.ai/image/${encodedPrompt}?model=black-forest-labs/flux.1-schnell&width=1024&height=1024&seed=${randomSeed}&key=${POLLINATIONS_API_KEY}`;
       
-      const imgRes = await fetch(pollinationUrl, {
-        headers: {
-          'Authorization': `Bearer ${POLLINATIONS_API_KEY}`
-        }
-      });
-
-      if (!imgRes.ok) {
-        throw new Error("Failed to generate image from Pollinations engine.");
-      }
-
-      // Convert image blob to base64 data URI so frontend can render it securely through gateway response
-      const arrayBuffer = await imgRes.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
-      const base64Image = `data:image/jpeg;base64,${buffer.toString('base64')}`;
-
       const imageJsonResponse = {
         id: "chatcmpl-" + crypto.randomBytes(4).toString('hex'),
         object: "chat.completion",
@@ -138,7 +123,7 @@ app.post('/v1/chat/completions', rateLimit, async (req, res) => {
           index: 0,
           message: {
             role: "assistant",
-            content: `Ye lijiye aapki image:\n\n![Generated Image](${base64Image})`
+            content: `Ye lijiye aapki image:\n\n![Generated Image](${workingPollinationsUrl})`
           },
           finish_reason: "stop"
         }]
@@ -261,4 +246,4 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`Omni Turbo running on port ${PORT}`);
 });
-        
+         
