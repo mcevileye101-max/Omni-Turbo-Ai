@@ -6,9 +6,9 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 app.use(cors());
 
-// ---------- Config ----------
+// ---------- Configuration & Keys ----------
 const GROQ_KEY = process.env.GROQ_API_KEY;
-// Aapki Pollinations Secret Key image generation ke liye
+// Aapki Pollinations Secret Key backend ke liye
 const POLLINATIONS_API_KEY = process.env.POLLINATIONS_API_KEY || "sk_yYtT2910mwEF96lkP6WcrLNbg693pogo";
 
 const OMNI_TURBO_SECRET_KEY =
@@ -19,10 +19,10 @@ const UPSTREAM_MODEL = "qwen/qwen3.8-27b";
 const UPSTREAM_URL = "https://api.groq.com/openai/v1/chat/completions";
 const UPSTREAM_TIMEOUT_MS = 120000;
 
-// Advanced System Prompt for Tone, Reasoning, and Deep Thinking
+// System Prompt for Deep Reasoning & Human Tone
 const SYSTEM_PROMPT = {
   role: "system",
-  content: "You are Omni Turbo 0.2, an advanced AI gateway. Maintain a natural human tone, break down complex topics into core concepts, apply deep reasoning and logic, and provide clean code and problem-solving solutions with easy understanding."
+  content: "You are Omni Turbo 0.2, an advanced AI gateway. Maintain a natural human tone, break down complex topics into core concepts, apply deep reasoning and logic, and provide clean code and problem-solving solutions."
 };
 
 // ---------- Helpers ----------
@@ -39,7 +39,7 @@ function errorBody(message, type = "server_error") {
   return { error: { message, type } };
 }
 
-// Simple in-memory rate limiter (per IP, 60 requests / minute)
+// Rate Limiter
 const hits = new Map();
 const RATE_LIMIT = 60;
 const RATE_WINDOW_MS = 60 * 1000;
@@ -65,7 +65,7 @@ setInterval(() => {
 
 app.set('trust proxy', 1);
 
-// ---------- Multi-Model Endpoint (Text & Image Generation) ----------
+// ---------- Multi-Model Chat & Image Gateway Endpoint ----------
 app.post('/v1/chat/completions', rateLimit, async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !safeEqual(authHeader, `Bearer ${OMNI_TURBO_SECRET_KEY}`)) {
@@ -85,7 +85,7 @@ app.post('/v1/chat/completions', rateLimit, async (req, res) => {
     return res.status(400).json(errorBody("Invalid format. 'messages' array is required.", "invalid_request_error"));
   }
 
-  // Check if user is asking for image generation (e.g., "generate image of...")
+  // Extract latest user prompt
   const lastUserMsg = messages.slice().reverse().find(m => m.role === 'user');
   let promptText = "";
   if (lastUserMsg) {
@@ -97,18 +97,39 @@ app.post('/v1/chat/completions', rateLimit, async (req, res) => {
     }
   }
 
-  // Agar user image generate karne ko bole, toh Pollinations FLUX model par route karo
+  // Check if image generation is requested
   const isImageRequest = promptText.toLowerCase().startsWith("generate image") || 
                          promptText.toLowerCase().startsWith("image of") ||
                          promptText.toLowerCase().startsWith("draw ");
 
   if (isImageRequest) {
     try {
+      if (!POLLINATIONS_API_KEY) {
+        return res.status(500).json(errorBody("Server is missing POLLINATIONS_API_KEY configuration."));
+      }
+
       const cleanPrompt = promptText.replace(/^(generate image of|image of|draw)\s*/i, "");
-      const imageUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(cleanPrompt)}?model=flux&nologo=true`;
+      const encodedPrompt = encodeURIComponent(cleanPrompt);
       
-      // Return OpenAI compatible chat response with image markdown inside it
-      const imageMarkdownResponse = {
+      // Call Pollinations Flux model securely using the backend API key
+      const pollinationUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?model=flux&nologo=true`;
+      
+      const imgRes = await fetch(pollinationUrl, {
+        headers: {
+          'Authorization': `Bearer ${POLLINATIONS_API_KEY}`
+        }
+      });
+
+      if (!imgRes.ok) {
+        throw new Error("Failed to generate image from Pollinations engine.");
+      }
+
+      // Convert image blob to base64 data URI so frontend can render it securely through gateway response
+      const arrayBuffer = await imgRes.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      const base64Image = `data:image/jpeg;base64,${buffer.toString('base64')}`;
+
+      const imageJsonResponse = {
         id: "chatcmpl-" + crypto.randomBytes(4).toString('hex'),
         object: "chat.completion",
         created: Math.floor(Date.now() / 1000),
@@ -117,14 +138,16 @@ app.post('/v1/chat/completions', rateLimit, async (req, res) => {
           index: 0,
           message: {
             role: "assistant",
-            content: `Ye lijiye aapki image:\n\n![Generated Image](${imageUrl})`
+            content: `Ye lijiye aapki image:\n\n![Generated Image](${base64Image})`
           },
           finish_reason: "stop"
         }]
       };
-      return res.json(imageMarkdownResponse);
+
+      return res.json(imageJsonResponse);
+
     } catch (err) {
-      return res.status(500).json(errorBody("Image generation failed: " + err.message));
+      return res.status(500).json(errorBody("Image generation error: " + err.message));
     }
   }
 
@@ -238,4 +261,4 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`Omni Turbo running on port ${PORT}`);
 });
-                         
+        
