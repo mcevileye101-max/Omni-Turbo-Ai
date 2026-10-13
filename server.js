@@ -8,7 +8,8 @@ app.use(cors());
 
 // ---------- Configuration & Keys ----------
 const GROQ_KEY = process.env.GROQ_API_KEY;
-const POLLINATIONS_API_KEY = process.env.POLLINATIONS_API_KEY || "sk_yYtT2910mwEF96lkP6WcrLNbg693pogo";
+// Set this ONLY in Render Environment Variables (never hardcode it in code)
+const POLLINATIONS_API_KEY = process.env.POLLINATIONS_API_KEY;
 
 const OMNI_TURBO_SECRET_KEY =
   process.env.OMNI_TURBO_SECRET_KEY || "omni_turbo_ai_ultimate303vHx77";
@@ -17,6 +18,12 @@ const PUBLIC_MODEL = "omni-turbo-0.2";
 const UPSTREAM_MODEL = "qwen/qwen3.8-27b";
 const UPSTREAM_URL = "https://api.groq.com/openai/v1/chat/completions";
 const UPSTREAM_TIMEOUT_MS = 120000;
+
+// Image provider (Pollinations unified API)
+const POLLINATIONS_BASE = "https://gen.pollinations.ai";
+const IMAGE_MODEL = process.env.POLLINATIONS_IMAGE_MODEL || "flux";
+const IMAGE_TIMEOUT_MS = 90000;
+const MAX_IMAGE_PROMPT_CHARS = 1000;
 
 const SYSTEM_PROMPT = {
   role: "system",
@@ -35,6 +42,11 @@ function safeEqual(a, b) {
 
 function errorBody(message, type = "server_error") {
   return { error: { message, type } };
+}
+
+function isAuthorized(req) {
+  const authHeader = req.headers.authorization;
+  return Boolean(authHeader) && safeEqual(authHeader, `Bearer ${OMNI_TURBO_SECRET_KEY}`);
 }
 
 // Rate Limiter
@@ -63,10 +75,121 @@ setInterval(() => {
 
 app.set('trust proxy', 1);
 
+// ---------- Image Generation ----------
+// Server fetches the image itself (key stays private) and returns base64.
+async function generateImage(prompt, { width = 1024, height = 1024 } = {}) {
+  if (!POLLINATIONS_API_KEY) {
+    throw new Error("Server is missing POLLINATIONS_API_KEY configuration.");
+  }
+
+  const seed = Math.floor(Math.random() * 1000000);
+  const url =
+    `${POLLINATIONS_BASE}/image/${encodeURIComponent(prompt.slice(0, MAX_IMAGE_PROMPT_CHARS))}` +
+    `?model=${encodeURIComponent(IMAGE_MODEL)}&width=${width}&height=${height}&seed=${seed}`;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), IMAGE_TIMEOUT_MS);
+
+  try {
+    const r = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${POLLINATIONS_API_KEY}` },
+      signal: controller.signal
+    });
+
+    const type = (r.headers.get('content-type') || '').split(';')[0];
+    if (!r.ok || !type.startsWith('image/')) {
+      let detail = '';
+      try { detail = (await r.text()).slice(0, 300); } catch (_) {}
+      throw new Error(`Image provider error (${r.status}): ${detail || 'no details'}`);
+    }
+
+    const buf = Buffer.from(await r.arrayBuffer());
+    return { mime: type, b64: buf.toString('base64') };
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error("Image generation timed out. Please try again.");
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// "generate image of a cat", "generate an image a cat", "create image of ...", "image of ...", "draw ..."
+const IMAGE_TRIGGER = /^\s*(?:(?:generate|create|make)\s+(?:an?\s+)?image(?:\s+of)?|image\s+of|draw)\s+/i;
+
+function extractPromptText(messages) {
+  const lastUserMsg = messages.slice().reverse().find(m => m && m.role === 'user');
+  if (!lastUserMsg) return "";
+  if (typeof lastUserMsg.content === 'string') return lastUserMsg.content;
+  if (Array.isArray(lastUserMsg.content)) {
+    const textPart = lastUserMsg.content.find(c => c && c.type === 'text');
+    return textPart ? textPart.text || "" : "";
+  }
+  return "";
+}
+
+// Generated images live in chat history as base64. Strip them before sending
+// history to Groq so the text model doesn't choke on huge payloads.
+const DATA_IMAGE_REGEX = /!\[[^\]]*\]\(data:image\/[^)]+\)/g;
+function stripImagesFromHistory(messages) {
+  return messages.map(m => {
+    if (!m) return m;
+    if (typeof m.content === 'string') {
+      return { ...m, content: m.content.replace(DATA_IMAGE_REGEX, "[generated image]") };
+    }
+    if (Array.isArray(m.content)) {
+      return {
+        ...m,
+        content: m.content.map(part =>
+          part && part.type === 'text' && typeof part.text === 'string'
+            ? { ...part, text: part.text.replace(DATA_IMAGE_REGEX, "[generated image]") }
+            : part
+        )
+      };
+    }
+    return m;
+  });
+}
+
+function sendChatReply(res, content, stream) {
+  const id = "chatcmpl-" + crypto.randomBytes(4).toString('hex');
+  const created = Math.floor(Date.now() / 1000);
+
+  if (stream) {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+
+    const base = { id, object: "chat.completion.chunk", created, model: PUBLIC_MODEL };
+    res.write(`data: ${JSON.stringify({
+      ...base,
+      choices: [{ index: 0, delta: { role: "assistant", content }, finish_reason: null }]
+    })}\n\n`);
+    res.write(`data: ${JSON.stringify({
+      ...base,
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+    })}\n\n`);
+    res.write("data: [DONE]\n\n");
+    return res.end();
+  }
+
+  return res.json({
+    id,
+    object: "chat.completion",
+    created,
+    model: PUBLIC_MODEL,
+    choices: [{
+      index: 0,
+      message: { role: "assistant", content },
+      finish_reason: "stop"
+    }]
+  });
+}
+
 // ---------- Multi-Model Chat & Image Gateway Endpoint ----------
 app.post('/v1/chat/completions', rateLimit, async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !safeEqual(authHeader, `Bearer ${OMNI_TURBO_SECRET_KEY}`)) {
+  if (!isAuthorized(req)) {
     return res.status(401).json(errorBody("Invalid or missing Custom API Key.", "authentication_error"));
   }
 
@@ -83,65 +206,28 @@ app.post('/v1/chat/completions', rateLimit, async (req, res) => {
     return res.status(400).json(errorBody("Invalid format. 'messages' array is required.", "invalid_request_error"));
   }
 
-  // Extract latest user prompt
-  const lastUserMsg = messages.slice().reverse().find(m => m.role === 'user');
-  let promptText = "";
-  if (lastUserMsg) {
-    if (typeof lastUserMsg.content === 'string') {
-      promptText = lastUserMsg.content;
-    } else if (Array.isArray(lastUserMsg.content)) {
-      const textPart = lastUserMsg.content.find(c => c.type === 'text');
-      if (textPart) promptText = textPart.text;
+  // ----- Image branch -----
+  const promptText = extractPromptText(messages);
+  if (IMAGE_TRIGGER.test(promptText)) {
+    const cleanPrompt = promptText.replace(IMAGE_TRIGGER, "").trim();
+    if (!cleanPrompt) {
+      return res.status(400).json(errorBody("Please describe the image you want.", "invalid_request_error"));
     }
-  }
-
-  // Check if image generation is requested
-  const isImageRequest = promptText.toLowerCase().startsWith("generate image") || 
-                         promptText.toLowerCase().startsWith("image of") ||
-                         promptText.toLowerCase().skip === true ||
-                         promptText.toLowerCase().startsWith("draw ");
-
-  if (isImageRequest) {
     try {
-      if (!POLLINATIONS_API_KEY) {
-        return res.status(500).json(errorBody("Server is missing POLLINATIONS_API_KEY configuration."));
-      }
-
-      const cleanPrompt = promptText.replace(/^(generate image of|image of|draw)\s*/i, "");
-      const encodedPrompt = encodeURIComponent(cleanPrompt);
-      const randomSeed = Math.floor(Math.random() * 1000000);
-      
-      // Using the exact working Pollinations endpoint structure with the API Key
-      const workingPollinationsUrl = `https://gen.pollinations.ai/image/${encodedPrompt}?model=black-forest-labs/flux.1-schnell&width=1024&height=1024&seed=${randomSeed}&key=${POLLINATIONS_API_KEY}`;
-      
-      const imageJsonResponse = {
-        id: "chatcmpl-" + crypto.randomBytes(4).toString('hex'),
-        object: "chat.completion",
-        created: Math.floor(Date.now() / 1000),
-        model: PUBLIC_MODEL,
-        choices: [{
-          index: 0,
-          message: {
-            role: "assistant",
-            content: `Ye lijiye aapki image:\n\n![Generated Image](${workingPollinationsUrl})`
-          },
-          finish_reason: "stop"
-        }]
-      };
-
-      return res.json(imageJsonResponse);
-
+      const { mime, b64 } = await generateImage(cleanPrompt);
+      const content = `Ye lijiye aapki image:\n\n![Generated Image](data:${mime};base64,${b64})`;
+      return sendChatReply(res, content, Boolean(stream));
     } catch (err) {
       return res.status(500).json(errorBody("Image generation error: " + err.message));
     }
   }
 
-  // Standard Text Handling via Groq & Qwen
+  // ----- Text branch (Groq & Qwen) -----
   if (!GROQ_KEY) {
     return res.status(500).json(errorBody("Server is missing GROQ_API_KEY configuration."));
   }
 
-  const updatedMessages = [SYSTEM_PROMPT, ...messages];
+  const updatedMessages = [SYSTEM_PROMPT, ...stripImagesFromHistory(messages)];
 
   const payload = {
     model: UPSTREAM_MODEL,
@@ -222,6 +308,30 @@ app.post('/v1/chat/completions', rateLimit, async (req, res) => {
   }
 });
 
+// ---------- OpenAI-compatible Image Endpoint ----------
+// POST /v1/images/generations  { "prompt": "a red fox", "size": "1024x1024" }
+app.post('/v1/images/generations', rateLimit, async (req, res) => {
+  if (!isAuthorized(req)) {
+    return res.status(401).json(errorBody("Invalid or missing Custom API Key.", "authentication_error"));
+  }
+
+  const { prompt, size = "1024x1024" } = req.body || {};
+  if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
+    return res.status(400).json(errorBody("'prompt' is required.", "invalid_request_error"));
+  }
+
+  const m = /^(\d{3,4})x(\d{3,4})$/.exec(size);
+  const width = m ? Math.min(parseInt(m[1], 10), 2048) : 1024;
+  const height = m ? Math.min(parseInt(m[2], 10), 2048) : 1024;
+
+  try {
+    const { b64 } = await generateImage(prompt.trim(), { width, height });
+    res.json({ created: Math.floor(Date.now() / 1000), data: [{ b64_json: b64 }] });
+  } catch (err) {
+    res.status(500).json(errorBody("Image generation error: " + err.message));
+  }
+});
+
 // Models List Endpoint
 app.get('/v1/models', (req, res) => {
   res.json({
@@ -234,7 +344,8 @@ app.get('/', (req, res) => {
   res.json({
     status: "active",
     service: "Omni Turbo 0.2 Multi-Modal Engine",
-    model: PUBLIC_MODEL
+    model: PUBLIC_MODEL,
+    image: Boolean(POLLINATIONS_API_KEY)
   });
 });
 
@@ -246,4 +357,3 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`Omni Turbo running on port ${PORT}`);
 });
-         
