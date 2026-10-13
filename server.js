@@ -7,11 +7,10 @@ app.use(express.json({ limit: '2mb' }));
 app.use(cors());
 
 // ---------- Config ----------
-// Internal Groq Key (Render Environment Variable)
 const GROQ_KEY = process.env.GROQ_API_KEY;
+// Aapki Pollinations Secret Key image generation ke liye
+const POLLINATIONS_API_KEY = process.env.POLLINATIONS_API_KEY || "sk_yYtT2910mwEF96lkP6WcrLNbg693pogo";
 
-// Custom Secret Key (set OMNI_TURBO_SECRET_KEY in Render env for better security;
-// falls back to the existing key so nothing breaks)
 const OMNI_TURBO_SECRET_KEY =
   process.env.OMNI_TURBO_SECRET_KEY || "omni_turbo_ai_ultimate303vHx77";
 
@@ -64,18 +63,13 @@ setInterval(() => {
   for (const [ip, e] of hits) if (now - e.start > RATE_WINDOW_MS) hits.delete(ip);
 }, RATE_WINDOW_MS).unref();
 
-// Render sits behind a proxy
 app.set('trust proxy', 1);
 
-// ---------- OpenAI-Style Endpoint with Streaming ----------
+// ---------- Multi-Model Endpoint (Text & Image Generation) ----------
 app.post('/v1/chat/completions', rateLimit, async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !safeEqual(authHeader, `Bearer ${OMNI_TURBO_SECRET_KEY}`)) {
     return res.status(401).json(errorBody("Invalid or missing Custom API Key.", "authentication_error"));
-  }
-
-  if (!GROQ_KEY) {
-    return res.status(500).json(errorBody("Server is missing GROQ_API_KEY configuration."));
   }
 
   const {
@@ -91,7 +85,54 @@ app.post('/v1/chat/completions', rateLimit, async (req, res) => {
     return res.status(400).json(errorBody("Invalid format. 'messages' array is required.", "invalid_request_error"));
   }
 
-  // Prepend System Context for Advanced Capabilities
+  // Check if user is asking for image generation (e.g., "generate image of...")
+  const lastUserMsg = messages.slice().reverse().find(m => m.role === 'user');
+  let promptText = "";
+  if (lastUserMsg) {
+    if (typeof lastUserMsg.content === 'string') {
+      promptText = lastUserMsg.content;
+    } else if (Array.isArray(lastUserMsg.content)) {
+      const textPart = lastUserMsg.content.find(c => c.type === 'text');
+      if (textPart) promptText = textPart.text;
+    }
+  }
+
+  // Agar user image generate karne ko bole, toh Pollinations FLUX model par route karo
+  const isImageRequest = promptText.toLowerCase().startsWith("generate image") || 
+                         promptText.toLowerCase().startsWith("image of") ||
+                         promptText.toLowerCase().startsWith("draw ");
+
+  if (isImageRequest) {
+    try {
+      const cleanPrompt = promptText.replace(/^(generate image of|image of|draw)\s*/i, "");
+      const imageUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(cleanPrompt)}?model=flux&nologo=true`;
+      
+      // Return OpenAI compatible chat response with image markdown inside it
+      const imageMarkdownResponse = {
+        id: "chatcmpl-" + crypto.randomBytes(4).toString('hex'),
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: PUBLIC_MODEL,
+        choices: [{
+          index: 0,
+          message: {
+            role: "assistant",
+            content: `Ye lijiye aapki image:\n\n![Generated Image](${imageUrl})`
+          },
+          finish_reason: "stop"
+        }]
+      };
+      return res.json(imageMarkdownResponse);
+    } catch (err) {
+      return res.status(500).json(errorBody("Image generation failed: " + err.message));
+    }
+  }
+
+  // Standard Text Handling via Groq & Qwen
+  if (!GROQ_KEY) {
+    return res.status(500).json(errorBody("Server is missing GROQ_API_KEY configuration."));
+  }
+
   const updatedMessages = [SYSTEM_PROMPT, ...messages];
 
   const payload = {
@@ -107,7 +148,6 @@ app.post('/v1/chat/completions', rateLimit, async (req, res) => {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
   res.on('close', () => {
-    // Client disconnected mid-stream: stop upstream work
     if (!res.writableEnded) controller.abort();
   });
 
@@ -128,7 +168,6 @@ app.post('/v1/chat/completions', rateLimit, async (req, res) => {
       throw new Error(errData.error?.message || "Internal Engine Error");
     }
 
-    // Handle Server-Sent Events (SSE) Streaming
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
@@ -145,11 +184,9 @@ app.post('/v1/chat/completions', rateLimit, async (req, res) => {
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
 
-        // Process only complete lines so the model name is never split across chunks
         const lines = buffer.split("\n");
         buffer = lines.pop();
         for (const line of lines) {
-          // Overwrite model identity in streaming chunks
           res.write(line.replace(MODEL_REGEX, PUBLIC_MODEL) + "\n");
         }
       }
@@ -158,7 +195,6 @@ app.post('/v1/chat/completions', rateLimit, async (req, res) => {
       return res.end();
     }
 
-    // Standard Non-Streaming Response with Model Overwrite
     const data = await groqResponse.json();
     data.model = PUBLIC_MODEL;
     res.json(data);
@@ -169,7 +205,6 @@ app.post('/v1/chat/completions', rateLimit, async (req, res) => {
       : (error.message || "An error occurred while processing your request.");
 
     if (res.headersSent) {
-      // Streaming already started: send an SSE error event and close
       res.write(`data: ${JSON.stringify(errorBody(message))}\n\n`);
       return res.end();
     }
@@ -179,7 +214,7 @@ app.post('/v1/chat/completions', rateLimit, async (req, res) => {
   }
 });
 
-// OpenAI-compatible model list (helps clients like Postman / SDKs)
+// Models List Endpoint
 app.get('/v1/models', (req, res) => {
   res.json({
     object: "list",
@@ -187,16 +222,14 @@ app.get('/v1/models', (req, res) => {
   });
 });
 
-// Health Check Endpoint
 app.get('/', (req, res) => {
   res.json({
     status: "active",
-    service: "Omni Turbo 0.2 AI Engine",
+    service: "Omni Turbo 0.2 Multi-Modal Engine",
     model: PUBLIC_MODEL
   });
 });
 
-// 404 fallback
 app.use((req, res) => {
   res.status(404).json(errorBody("Route not found.", "not_found_error"));
 });
@@ -205,3 +238,4 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`Omni Turbo running on port ${PORT}`);
 });
+                         
